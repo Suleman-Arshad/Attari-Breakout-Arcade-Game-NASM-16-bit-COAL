@@ -1,0 +1,1227 @@
+; Atari Breakout Game 
+; 16-bit NASM .COM
+org 0x0100
+
+jmp start
+
+; -----------------------
+; DATA SECTION
+; -----------------------
+; Ball data
+char_ball    db 79       ; full block for ball
+ball_attr    db 0x0E      ; yellow on black
+
+x_pos        db 40        ; start at center
+y_pos        db 20
+old_x        db 40
+old_y        db 20
+
+x_dir        db 0         ; -1, 0, +1 (starts stationary)
+y_dir        db 0         ; -1 (up) or +1 (down)
+ball_launched db 0        ; 0 = not launched, 1 = launched
+
+; Paddle data
+paddle_width equ 10
+paddle_attr  db 0x1F      ; white on blue background
+paddle_x     db 36        ; leftmost column of paddle
+old_paddle_x db 36
+paddle_y     db 23        ; row 23 (0..24)
+
+; Bricks data
+brick_rows   equ 4
+brick_cols   equ 10
+brick_width  equ 7
+brick_height equ 2
+brick_start_row equ 2
+brick_start_col equ 1
+
+; Brick array: 1 = exists, 0 = destroyed (4 rows x 10 cols = 40 bricks)
+bricks: times 40 db 1
+
+; Game state
+lives        db 3
+score        dw 0
+game_over_flag db 0
+
+; Strings
+lives_str:   db 'Lives: ',0
+score_str:   db 'Score: ',0
+game_over_str: db 'GAME OVER! Press ESC to exit...',0
+you_win_str:   db 'YOU WIN! Press ESC to exit...',0
+
+title1: db '===============================',0
+title2: db '   Atari Breakout Arcade Game   ',0
+title3: db '===============================',0
+title4: db 'Press ENTER to start...',0
+desc_line1: db 'Break all bricks using the ball and paddle.',0
+desc_line2: db 'Move the paddle to bounce the ball.',0
+
+rule_lives:  db '* Lives: 3',0
+rule_score:  db '* Score increases by breaking bricks',0
+rule_left:   db '* Move Left :  <-  key',0
+rule_right:  db '* Move Right:  ->  key',0
+rule_launch: db '* Launch Ball: SPACE',0
+
+; -----------------------
+; CLEAR SCREEN
+; -----------------------
+clrscr:
+    push ax
+    push es
+    push di
+    push cx
+
+    mov ax, 0xB800
+    mov es, ax
+    xor di, di
+    mov ax, 0x0720
+    mov cx, 2000
+    cld
+    rep stosw
+
+    pop cx
+    pop di
+    pop es
+    pop ax
+    ret
+
+; -----------------------
+; CALCULATE OFFSET DI = (y*80 + x)*2
+; AL = x , AH = y
+; -----------------------
+calc_offset:
+    push ax
+    push bx
+
+    mov bl, al          ; BL = x
+    mov al, 80
+    mul ah              ; AX = y * 80
+    xor bh, bh
+    add ax, bx          ; AX = y*80 + x
+    shl ax, 1           ; AX = (y*80 + x) * 2
+    mov di, ax
+
+    pop bx
+    pop ax
+    ret
+
+; -----------------------
+; PRINT STRING AT (X, Y) WITH ATTRIBUTE
+; Parameters on stack: x, y, attribute, string_addr
+; -----------------------
+printstr:
+    push bp
+    mov bp, sp
+    push es
+    push ax
+    push cx
+    push si
+    push di
+
+    ; Calculate string length
+    mov di, [bp+4]        ; string address
+    mov cx, 0FFFFh
+    xor al, al
+    push es
+    push ds
+    pop es
+    repne scasb
+    pop es
+    mov ax, 0FFFFh
+    sub ax, cx
+    dec ax
+    jz .exit_print
+    mov cx, ax            ; CX = length
+
+    ; Calculate screen position
+    mov ax, 0xb800
+    mov es, ax
+    mov al, 80
+    mul byte [bp+8]       ; y position
+    add ax, [bp+10]       ; x position
+    shl ax, 1
+    mov di, ax
+
+    ; Print string
+    mov si, [bp+4]        ; string address
+    mov ah, [bp+6]        ; attribute
+    cld
+.nextchar:
+    lodsb
+    stosw
+    loop .nextchar
+
+.exit_print:
+    pop di
+    pop si
+    pop cx
+    pop ax
+    pop es
+    pop bp
+    ret 8
+
+; -----------------------
+; ERASE OLD BALL
+; -----------------------
+erase_old_ball:
+    push ax
+    push es
+    push di
+    
+    mov ax, 0xB800
+    mov es, ax
+    mov al, [old_x]
+    mov ah, [old_y]
+    call calc_offset
+    mov ax, 0x0720
+    mov [es:di], ax
+    
+    pop di
+    pop es
+    pop ax
+    ret
+
+; -----------------------
+; DRAW BALL
+; -----------------------
+draw_ball:
+    push ax
+    push es
+    push di
+    
+    mov ax, 0xB800
+    mov es, ax
+    mov al, [x_pos]
+    mov ah, [y_pos]
+    call calc_offset
+    mov al, [char_ball]
+    mov ah, [ball_attr]
+    mov [es:di], ax
+    
+    pop di
+    pop es
+    pop ax
+    ret
+
+; -----------------------
+; ERASE OLD PADDLE
+; -----------------------
+erase_old_paddle:
+    push ax
+    push bx
+    push cx
+    push es
+    push di
+    
+    mov ax, 0xB800
+    mov es, ax
+    mov bl, [old_paddle_x]
+    mov cx, paddle_width
+.epl:
+    mov al, bl
+    mov ah, [paddle_y]
+    call calc_offset
+    mov ax, 0x0720
+    mov [es:di], ax
+    inc bl
+    loop .epl
+    
+    pop di
+    pop es
+    pop cx
+    pop bx
+    pop ax
+    ret
+
+; -----------------------
+; DRAW PADDLE
+; -----------------------
+draw_paddle:
+    push ax
+    push bx
+    push cx
+    push es
+    push di
+    
+    mov ax, 0xB800
+    mov es, ax
+    mov bl, [paddle_x]
+    mov cx, paddle_width
+.dpl:
+    mov al, bl
+    mov ah, [paddle_y]
+    call calc_offset
+    mov al, 0x20
+    mov ah, [paddle_attr]
+    mov [es:di], ax
+    inc bl
+    loop .dpl
+    
+    pop di
+    pop es
+    pop cx
+    pop bx
+    pop ax
+    ret
+
+; -----------------------
+; DRAW SINGLE BRICK AT ROW, COL
+; BL = row index (0-3), BH = col index (0-9)
+; -----------------------
+draw_single_brick:
+    push ax
+    push bx
+    push cx
+    push dx
+    push es
+    push di
+    
+    mov ax, 0xB800
+    mov es, ax
+    
+    ; Calculate color based on row (save in DH)
+    mov al, bl
+    shl al, 4            ; multiply by 16
+    add al, 0x10
+    cmp al, 0x50
+    jle .color_ok
+    mov al, 0x60
+.color_ok:
+    mov dh, al           ; DH = attribute (SAVE IT HERE)
+    
+    ; Calculate starting position
+    mov al, bl
+    mov dl, brick_height
+    mul dl
+    add al, brick_start_row
+    push ax              ; Save y position on stack
+    
+    mov al, bh
+    mov ah, brick_width + 1
+    mul ah
+    add al, brick_start_col
+    mov cl, al           ; CL = x position
+    
+    pop ax               ; Restore y position to AL
+    mov ch, al           ; CH = y position
+    
+    ; Draw first row of brick
+    push cx              ; Save positions
+    mov bl, brick_width
+.draw_row1:
+    mov al, cl           ; x position
+    mov ah, ch           ; y position
+    push bx
+    push cx
+    call calc_offset
+    mov al, 0x20         ; block character
+    mov ah, dh           ; attribute from DH
+    mov [es:di], ax
+    pop cx
+    pop bx
+    inc cl
+    dec bl
+    jnz .draw_row1
+    
+    pop cx               ; Restore positions
+    inc ch               ; Move to next row
+    
+    ; Draw second row of brick
+    mov bl, brick_width
+.draw_row2:
+    mov al, cl           ; x position
+    mov ah, ch           ; y position
+    push bx
+    push cx
+    call calc_offset
+    mov al, 0xDB         ; block character
+    mov ah, dh           ; attribute from DH
+    mov [es:di], ax
+    pop cx
+    pop bx
+    inc cl
+    dec bl
+    jnz .draw_row2
+    
+    pop di
+    pop es
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ret
+
+; -----------------------
+; ERASE SINGLE BRICK AT ROW, COL
+; BL = row index (0-3), BH = col index (0-9)
+; -----------------------
+erase_single_brick:
+    push ax
+    push bx
+    push cx
+    push dx
+    push es
+    push di
+    
+    mov ax, 0xB800
+    mov es, ax
+    
+    ; Calculate starting position
+    mov al, bl
+    mov dl, brick_height
+    mul dl
+    add al, brick_start_row
+    mov dl, al           ; DL = y position
+    
+    mov al, bh
+    mov ah, brick_width + 1
+    mul ah
+    add al, brick_start_col
+    mov dh, al           ; DH = x position
+    
+    ; Erase first row
+    mov ch, 0
+    mov cl, brick_width
+.erase_row1:
+    mov al, dh
+    mov ah, dl
+    push cx
+    call calc_offset
+    mov ax, 0x0720
+    mov [es:di], ax
+    pop cx
+    inc dh
+    loop .erase_row1
+    
+    ; Erase second row
+    mov al, bh
+    mov ah, brick_width + 1
+    mul ah
+    add al, brick_start_col
+    mov dh, al
+    inc dl
+    
+    mov ch, 0
+    mov cl, brick_width
+.erase_row2:
+    mov al, dh
+    mov ah, dl
+    push cx
+    call calc_offset
+    mov ax, 0x0720
+    mov [es:di], ax
+    pop cx
+    inc dh
+    loop .erase_row2
+    
+    pop di
+    pop es
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ret
+
+; -----------------------
+; DRAW ALL BRICKS
+; -----------------------
+draw_all_bricks:
+    push ax
+    push bx
+    push cx
+    push si
+    
+    xor si, si           ; brick index
+    mov bl, 0            ; row index
+    
+.row_loop:
+    mov bh, 0            ; col index
+    
+.col_loop:
+    ; Check if brick exists
+    mov al, [bricks + si]
+    cmp al, 0
+    je .skip_brick
+    
+    ; Draw brick
+    push bx
+    push si
+    call draw_single_brick
+    pop si
+    pop bx
+    
+.skip_brick:
+    inc si
+    inc bh
+    cmp bh, brick_cols
+    jl .col_loop
+    
+    inc bl
+    cmp bl, brick_rows
+    jl .row_loop
+    
+    pop si
+    pop cx
+    pop bx
+    pop ax
+    ret
+
+; -----------------------
+; CHECK BRICK COLLISION
+; Returns: AL = 1 if hit, 0 if no hit
+; -----------------------
+check_brick_collision:
+    push bx
+    push cx
+    push dx
+    push si
+    
+    mov al, [y_pos]
+    
+    ; Check if ball is in brick area
+    cmp al, brick_start_row
+    jl .no_hit
+    mov bl, brick_start_row
+    mov cl, brick_rows
+    mov dl, brick_height
+    xor dh, dh
+    mov al, cl
+    mul dl
+    add al, bl
+    cmp byte [y_pos], al
+    jge .no_hit
+    
+    ; Calculate which brick row
+    mov al, [y_pos]
+    sub al, brick_start_row
+    xor ah, ah
+    mov bl, brick_height
+    div bl
+    mov cl, al           ; CL = row index
+    
+    ; Calculate which brick column
+    mov al, [x_pos]
+    cmp al, brick_start_col
+    jl .no_hit
+    sub al, brick_start_col
+    xor ah, ah
+    mov bl, brick_width + 1
+    div bl
+    cmp al, brick_cols
+    jge .no_hit
+    mov ch, al           ; CH = col index
+    
+    ; Calculate brick index = row * brick_cols + col
+    mov al, cl
+    mov bl, brick_cols
+    mul bl
+    add al, ch
+    xor ah, ah
+    mov si, ax
+    
+    ; Check if brick exists
+    cmp byte [bricks + si], 0
+    je .no_hit
+    
+    ; Destroy brick
+    mov byte [bricks + si], 0
+    
+    
+    call sound_brick     ; ADD THIS LINE
+
+    ; Erase brick from screen
+    mov bl, cl           ; row
+    mov bh, ch           ; col
+    call erase_single_brick
+    
+    ; Increase score
+    add word [score], 10
+    
+    ; Reverse ball Y direction
+    neg byte [y_dir]
+    
+    mov al, 1
+    jmp .done
+    
+.no_hit:
+    xor al, al
+    
+.done:
+    pop si
+    pop dx
+    pop cx
+    pop bx
+    ret
+
+; -----------------------
+; CHECK IF ALL BRICKS DESTROYED
+; Returns: AL = 1 if all destroyed, 0 otherwise
+; -----------------------
+check_win:
+    push cx
+    push si
+    
+    xor si, si
+    mov cx, 40
+.check_loop:
+    cmp byte [bricks + si], 1
+    je .not_all_destroyed
+    inc si
+    loop .check_loop
+    
+    mov al, 1
+    jmp .done
+    
+.not_all_destroyed:
+    xor al, al
+    
+.done:
+    pop si
+    pop cx
+    ret
+
+; -----------------------
+; DISPLAY GAME INFO (lives, score)
+; -----------------------
+display_info:
+    push ax
+    push bx
+    push cx
+    push dx
+    push es
+    push di
+    
+    mov ax, 0xB800
+    mov es, ax
+    
+    ; Display "Lives: X"
+    mov di, (0 * 80 + 1) * 2
+    mov si, lives_str
+.print_lives_str:
+    lodsb
+    cmp al, 0
+    je .lives_str_done
+    mov ah, 0x0F
+    stosw
+    jmp .print_lives_str
+    
+.lives_str_done:
+    mov al, [lives]
+    add al, '0'
+    mov ah, 0x0F
+    stosw
+    
+    ; Display "Score: XXX"
+    mov di, (0 * 80 + 60) * 2
+    mov si, score_str
+.print_score_str:
+    lodsb
+    cmp al, 0
+    je .score_str_done
+    mov ah, 0x0F
+    stosw
+    jmp .print_score_str
+    
+.score_str_done:
+    ; Convert score to decimal
+    mov ax, [score]
+    mov cx, 0
+    mov bx, 10
+    
+.score_to_decimal:
+    xor dx, dx
+    div bx
+    push dx
+    inc cx
+    cmp ax, 0
+    jne .score_to_decimal
+    
+.print_score_digits:
+    pop ax
+    add al, '0'
+    mov ah, 0x0F
+    stosw
+    loop .print_score_digits
+    
+    pop di
+    pop es
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ret
+
+; -----------------------
+; DELAY - SLOWER FOR BETTER GAMEPLAY
+; -----------------------
+delay_small:
+    push cx
+    push dx
+    
+    mov cx, 0x0003       ; outer loop - INCREASED for slower speed
+.outer:
+    mov dx, 0xFFFF       ; inner loop
+.inner:
+    dec dx
+    jnz .inner
+    loop .outer
+    
+    pop dx
+    pop cx
+    ret
+; -----------------------
+; BEEP SOUND
+; AL = frequency divisor (lower = higher pitch)
+; CX = duration
+; -----------------------
+make_sound:
+    push ax
+    push bx
+    push cx
+    
+    ; Set up the PIT (Programmable Interval Timer)
+    mov al, 0xB6        ; Configure PIT
+    out 0x43, al
+    
+    pop cx
+    push cx
+    mov ax, cx          ; Frequency divisor
+    out 0x42, al        ; Send low byte
+    mov al, ah
+    out 0x42, al        ; Send high byte
+    
+    ; Turn on speaker
+    in al, 0x61
+    or al, 0x03
+    out 0x61, al
+    
+    ; Duration delay
+    pop cx
+    push cx
+.sound_delay:
+    push cx
+    mov cx, 0x1FFF
+.inner_delay:
+    loop .inner_delay
+    pop cx
+    loop .sound_delay
+    
+    ; Turn off speaker
+    in al, 0x61
+    and al, 0xFC
+    out 0x61, al
+    
+    pop cx
+    pop bx
+    pop ax
+    ret
+
+; Sound effect: Ball hits paddle (low beep)
+sound_paddle:
+    push ax
+    push cx
+    mov ax, 500         ; Low frequency
+    mov cx, 2           ; Short duration
+    call make_sound
+    pop cx
+    pop ax
+    ret
+
+; Sound effect: Brick broken (medium beep)
+sound_brick:
+    push ax
+    push cx
+    mov ax, 800         ; Medium frequency
+    mov cx, 3           ; Medium duration
+    call make_sound
+    pop cx
+    pop ax
+    ret
+
+; Sound effect: Life lost (sad beep sequence)
+sound_life_lost:
+    push ax
+    push cx
+    
+    ; First beep (high)
+    mov ax, 400
+    mov cx, 5
+    call make_sound
+    
+    ; Small pause
+    mov cx, 0x3FFF
+.pause1:
+    loop .pause1
+    
+    ; Second beep (lower)
+    mov ax, 200
+    mov cx, 8
+    call make_sound
+    
+    pop cx
+    pop ax
+    ret
+; -----------------------
+; MENU SCREEN
+; -----------------------
+Menu:
+    call clrscr
+
+    ; Title Line 1
+    mov ax, 24
+    push ax
+    mov ax, 3
+    push ax
+    mov ax, 0x1E
+    push ax
+    mov ax, title1
+    push ax
+    call printstr
+
+    ; Title Line 2
+    mov ax, 23
+    push ax
+    mov ax, 5
+    push ax
+    mov ax, 0x1E
+    push ax
+    mov ax, title2
+    push ax
+    call printstr
+
+    ; Title Line 3
+    mov ax, 24
+    push ax
+    mov ax, 7
+    push ax
+    mov ax, 0x1E
+    push ax
+    mov ax, title3
+    push ax
+    call printstr
+
+    ; Description Line 1
+    mov ax, 5
+    push ax
+    mov ax, 10
+    push ax
+    mov ax, 0x0F
+    push ax
+    mov ax, desc_line1
+    push ax
+    call printstr
+
+    ; Description Line 2
+    mov ax, 5
+    push ax
+    mov ax, 11
+    push ax
+    mov ax, 0x0F
+    push ax
+    mov ax, desc_line2
+    push ax
+    call printstr
+
+    ; Rules
+    mov ax, 5
+    push ax
+    mov ax, 14
+    push ax
+    mov ax, 0x0A
+    push ax
+    mov ax, rule_lives
+    push ax
+    call printstr
+
+    mov ax, 5
+    push ax
+    mov ax, 15
+    push ax
+    mov ax, 0x0A
+    push ax
+    mov ax, rule_score
+    push ax
+    call printstr
+
+    mov ax, 5
+    push ax
+    mov ax, 16
+    push ax
+    mov ax, 0x0A
+    push ax
+    mov ax, rule_left
+    push ax
+    call printstr
+
+    mov ax, 5
+    push ax
+    mov ax, 17
+    push ax
+    mov ax, 0x0A
+    push ax
+    mov ax, rule_right
+    push ax
+    call printstr
+
+    mov ax, 5
+    push ax
+    mov ax, 18
+    push ax
+    mov ax, 0x0A
+    push ax
+    mov ax, rule_launch
+    push ax
+    call printstr
+
+    ; Press ENTER to start
+    mov ax, 12
+    push ax
+    mov ax, 21
+    push ax
+    mov ax, 0x0F
+    push ax
+    mov ax, title4
+    push ax
+    call printstr
+
+.wait_enter:
+    mov ah, 0
+    int 16h
+    cmp al, 13
+    jne .wait_enter
+    ret
+
+; -----------------------
+; INITIALIZE GAME
+; -----------------------
+init_game:
+    ; Reset all bricks
+    push cx
+    push si
+    xor si, si
+    mov cx, 40
+.reset_loop:
+    mov byte [bricks + si], 1
+    inc si
+    loop .reset_loop
+    pop si
+    pop cx
+    
+    ; Reset ball position (on paddle)
+    mov byte [x_pos], 40
+    mov byte [y_pos], 22
+    mov byte [old_x], 40
+    mov byte [old_y], 22
+    mov byte [x_dir], 0
+    mov byte [y_dir], 0
+    mov byte [ball_launched], 0
+    
+    ; Reset paddle position
+    mov byte [paddle_x], 36
+    mov byte [old_paddle_x], 36
+    
+    ; Reset game state
+    mov byte [lives], 3
+    mov word [score], 0
+    mov byte [game_over_flag], 0
+    ret
+
+; -----------------------
+; MAIN GAME LOOP
+; -----------------------
+game_loop:
+    call clrscr
+    
+    mov ax, 0xB800
+    mov es, ax
+    
+    ; Draw initial game state
+    call draw_all_bricks
+    call display_info
+    call draw_paddle
+    call draw_ball
+
+.main_loop:
+    ; Check game over conditions
+    cmp byte [game_over_flag], 1
+    je near .game_over_screen
+    
+    ; Check win condition
+    call check_win
+    cmp al, 1
+    je near .you_win_screen
+    
+    ; Save previous positions
+    mov al, [x_pos]
+    mov [old_x], al
+    mov al, [y_pos]
+    mov [old_y], al
+    mov al, [paddle_x]
+    mov [old_paddle_x], al
+
+   ; Keyboard handling - NON-BLOCKING
+    mov ah, 01h
+    int 16h
+    jz near .no_key_pending
+
+    ; Key is available, read it
+    mov ah, 00h
+    int 16h
+
+    cmp al, 0
+    jne .check_space
+    
+    ; Arrow keys
+    cmp ah, 0x4B          ; left arrow
+    je .move_left
+    cmp ah, 0x4D          ; right arrow
+    je .move_right
+    jmp .no_key_pending
+
+.check_space:
+    cmp al, 32            ; SPACE
+    je .launch_ball
+    cmp al, 27            ; ESC
+    je near .exit_prog
+    jmp .no_key_pending
+
+.launch_ball:
+    cmp byte [ball_launched], 0
+    jne .no_key_pending
+    mov byte [ball_launched], 1
+    mov byte [y_dir], -1
+    mov byte [x_dir], 1
+    jmp .no_key_pending
+
+.move_left:
+    mov al, [paddle_x]
+    cmp al, 0
+    jle .check_more_keys    ; Don't skip, check for more keys
+    sub al, 3               ; INCREASED from 2 to 3 for smoother movement
+    cmp al, 0
+    jge .set_paddle_left
+    mov al, 0
+.set_paddle_left:
+    mov [paddle_x], al
+    
+    ; Move ball with paddle if not launched
+    cmp byte [ball_launched], 0
+    jne .check_more_keys
+    mov al, [paddle_x]
+    add al, paddle_width / 2
+    mov [x_pos], al
+    jmp .check_more_keys
+
+.move_right:
+    mov al, [paddle_x]
+    mov bl, 80
+    sub bl, paddle_width
+    cmp al, bl
+    jge .check_more_keys
+    add al, 3               ; INCREASED from 2 to 3 for smoother movement
+    cmp al, bl
+    jle .set_paddle_right
+    mov al, bl
+.set_paddle_right:
+    mov [paddle_x], al
+    
+    ; Move ball with paddle if not launched
+    cmp byte [ball_launched], 0
+    jne .check_more_keys
+    mov al, [paddle_x]
+    add al, paddle_width / 2
+    mov [x_pos], al
+    jmp .check_more_keys
+
+.check_more_keys:
+    ; Check if another key is waiting
+    mov ah, 01h
+    int 16h
+    jnz .no_key_pending     ; If key waiting, process it immediately
+    ; Fall through to no_key_pending
+
+.no_key_pending:
+    ; Erase old positions
+    call erase_old_ball
+    call erase_old_paddle
+
+    ; Update ball only if launched
+    cmp byte [ball_launched], 0
+    je near .skip_ball_update
+
+    ; Update ball X
+    mov al, [x_pos]
+    mov bl, [x_dir]
+    add al, bl
+    cmp al, 0
+    jl .bx_left
+    cmp al, 79
+    jg .bx_right
+    mov [x_pos], al
+    jmp .after_bx
+
+.bx_left:
+    mov byte [x_pos], 1
+    mov byte [x_dir], 1
+    jmp .after_bx
+
+.bx_right:
+    mov byte [x_pos], 78
+    mov byte [x_dir], -1
+
+.after_bx:
+    ; Update ball Y
+    mov al, [y_pos]
+    mov bl, [y_dir]
+    add al, bl
+
+    cmp al, 1
+    jl near .by_top_hit
+    cmp al, 24
+    jg near .by_bottom_hit
+
+    ; Store new Y position temporarily
+    mov [y_pos], al
+    
+    ; Check brick collision
+    call check_brick_collision
+    
+    ; Continue with paddle collision check
+    mov al, [y_pos]
+    mov ah, [y_dir]
+    cmp ah, 1
+    jne near .after_by
+
+    mov bl, al
+    mov dl, [paddle_y]
+    cmp bl, dl
+    jne near .after_by
+
+    ; Ball is at paddle row - check horizontal overlap
+    mov al, [x_pos]
+    xor bh, bh
+    mov bl, [paddle_x]
+    cmp al, bl
+    jb near .after_by
+    mov bl, [paddle_x]
+    add bl, paddle_width
+    dec bl
+    cmp al, bl
+    ja near .after_by
+
+    ; Ball hits paddle
+    mov al, [x_pos]
+    mov bl, [paddle_x]
+    sub al, bl            ; AL = hit position on paddle
+
+    mov bl, paddle_width
+    shr bl, 1             ; BL = center of paddle
+    cmp al, bl
+    je .hit_center
+    jb .hit_left
+    jmp .hit_right
+
+.hit_center:
+    call sound_paddle
+    mov byte [y_pos], 22
+    mov byte [y_dir], -1
+    mov byte [x_dir], 0
+    jmp .after_by
+
+.hit_left:
+    call sound_paddle
+    mov byte [y_pos], 22
+    mov byte [y_dir], -1
+    mov byte [x_dir], -1
+    jmp .after_by
+
+.hit_right:
+    call sound_paddle
+    mov byte [y_pos], 22
+    mov byte [y_dir], -1
+    mov byte [x_dir], 1
+    jmp .after_by
+
+.by_top_hit:
+    mov byte [y_pos], 1
+    mov byte [y_dir], 1
+    jmp .after_by
+
+.by_bottom_hit:
+    ; Ball fell off bottom - lose a life
+    call sound_life_lost   ; ADD THIS LINE
+    dec byte [lives]
+    cmp byte [lives], 0
+    je .set_game_over
+    
+    ; Reset ball on paddle
+    mov byte [ball_launched], 0
+    mov byte [x_pos], 40
+    mov byte [y_pos], 22
+    mov byte [x_dir], 0
+    mov byte [y_dir], 0
+    jmp .after_by
+
+.set_game_over:
+    mov byte [game_over_flag], 1
+    jmp .after_by
+
+.after_by:
+.skip_ball_update:
+    ; Redraw everything
+    call draw_paddle
+    call draw_ball
+    call display_info
+
+    ; Delay - SLOWER NOW
+    call delay_small
+    jmp .main_loop
+
+.game_over_screen:
+    call clrscr
+    mov ax, 24
+    push ax
+    mov ax, 12
+    push ax
+    mov ax, 0x4F          ; white on red
+    push ax
+    mov ax, game_over_str
+    push ax
+    call printstr
+    
+.wait_esc_go:
+    mov ah, 0
+    int 16h
+    cmp al, 27
+    jne .wait_esc_go
+    jmp .exit_prog
+
+.you_win_screen:
+    call clrscr
+    mov ax, 24
+    push ax
+    mov ax, 12
+    push ax
+    mov ax, 0x2F          ; white on green
+    push ax
+    mov ax, you_win_str
+    push ax
+    call printstr
+    
+.wait_esc_win:
+    mov ah, 0
+    int 16h
+    cmp al, 27
+    jne .wait_esc_win
+
+.exit_prog:
+    mov ax, 4C00h
+    int 21h
+
+; -----------------------
+; PROGRAM START
+; -----------------------
+start:
+    call Menu
+    call init_game
+    call game_loop
